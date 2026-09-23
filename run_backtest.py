@@ -4,13 +4,17 @@ Backtest (paper money on historical data) — run this FIRST.
 Usage:
     .venv/bin/python run_backtest.py
 
-By default it generates synthetic BTC/USDT-style 1-minute bars so it works
-offline with zero API keys. No real money is involved, ever.
+Data priority:
+  1. data/btcusdt_1m.csv   — real candles from `python fetch_data.py`
+  2. synthetic bars        — offline fallback so the demo always runs
+
+No API keys. No real money. Ever.
 """
 
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -31,15 +35,20 @@ from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from strategies.ema_cross import EMACross
 from strategies.ema_cross import EMACrossConfig
 
-N_BARS = 5_000  # ~3.5 days of 1-minute bars
+N_BARS = 5_000  # ~3.5 days of 1-minute bars (synthetic fallback)
 STARTING_CASH = 10_000  # fake USDT
-TRADE_SIZE = Decimal("0.01")  # BTC per trade (tiny — risk management matters)
+TRADE_SIZE = Decimal("0.01")  # BTC per trade — keep it small
+CSV_PATH = Path("data/btcusdt_1m.csv")
+
+# Risk guardrails — tune carefully, these are your seatbelt
+STOP_LOSS_PCT = 0.02  # exit if a trade loses 2%
+TAKE_PROFIT_PCT = 0.04  # bank profit at +4% (2:1 reward:risk)
+DAILY_LOSS_LIMIT_PCT = 0.03  # halt for the day if down 3% from day start
 
 
 def make_synthetic_bars(n: int = N_BARS, seed: int = 42) -> pd.DataFrame:
     """Generate a realistic-looking random walk with trending regimes."""
     rng = np.random.default_rng(seed)
-    # Slowly swinging drift creates trends the EMA cross can actually catch
     drift = np.sin(np.linspace(0, 8 * np.pi, n)) * 0.00035
     noise = rng.normal(0.0, 0.0006, n)
     close = 50_000.0 * np.exp(np.cumsum(drift + noise))
@@ -54,6 +63,31 @@ def make_synthetic_bars(n: int = N_BARS, seed: int = 42) -> pd.DataFrame:
         {"open": open_, "high": high, "low": low, "close": close, "volume": volume},
         index=index,
     )
+
+
+def load_bars() -> pd.DataFrame:
+    if CSV_PATH.exists():
+        df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"], index_col="timestamp")
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        # Keep only the columns the wrangler needs, in order
+        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        print(f"Using REAL candles from {CSV_PATH} ({len(df):,} bars)")
+        return df
+    print("No CSV found — using SYNTHETIC candles (offline demo).")
+    print("Tip: run `python fetch_data.py` for real Binance history.")
+    return make_synthetic_bars()
+
+
+def final_usdt_balance(engine: BacktestEngine) -> float | None:
+    try:
+        report = engine.trader.generate_account_report(Venue("BINANCE"))
+        usdt = report[report["currency"] == "USDT"]
+        if usdt.empty:
+            return None
+        return float(usdt["total"].iloc[-1])
+    except Exception:
+        return None
 
 
 def main() -> None:
@@ -78,17 +112,21 @@ def main() -> None:
     )
     engine.add_instrument(instrument)
 
-    bars_df = make_synthetic_bars()
+    bars_df = load_bars()
     wrangler = BarDataWrangler(bar_type, instrument)
     bars = wrangler.process(bars_df)
     engine.add_data(bars)
-    print(f"Loaded {len(bars):,} synthetic 1-minute bars (fake money only)")
+    print(f"Loaded {len(bars):,} 1-minute bars (fake money only)")
 
     strategy = EMACross(
         EMACrossConfig(
             instrument_id=instrument.id,
             bar_type=bar_type,
             trade_size=TRADE_SIZE,
+            allow_short=True,  # simulation only; live spot should be False
+            stop_loss_pct=STOP_LOSS_PCT,
+            take_profit_pct=TAKE_PROFIT_PCT,
+            daily_loss_limit_pct=DAILY_LOSS_LIMIT_PCT,
         )
     )
     engine.add_strategy(strategy)
@@ -96,36 +134,55 @@ def main() -> None:
     print("Running backtest...")
     engine.run()
 
-    # --- Results ---
-    print("\n=== RESULTS (paper money) ===")
-    try:
-        result = engine.get_result()
-        # Print whatever stats the engine exposes for this version
-        stats = getattr(result, "stats_returns", None) or getattr(result, "stats", None)
-        if stats:
-            for key, value in (stats.items() if isinstance(stats, dict) else []):
-                print(f"  {key}: {value}")
-        else:
-            print(result)
-    except Exception as exc:  # API surface changes between versions
-        print(f"(Could not pull structured stats: {exc})")
+    # --- Results -------------------------------------------------------
+    first_close = float(bars_df["close"].iloc[0])
+    last_close = float(bars_df["close"].iloc[-1])
+    buy_hold = STARTING_CASH * (last_close / first_close)
+    final_balance = final_usdt_balance(engine)
+    strat_ret = (
+        (final_balance / STARTING_CASH - 1.0) if final_balance is not None else None
+    )
+    bh_ret = buy_hold / STARTING_CASH - 1.0
 
-    try:
-        report = engine.trader.generate_account_report(Venue("BINANCE"))
-        print("\nFinal account balance:")
-        print(report.tail(3).to_string())
-    except Exception:
-        pass
+    print("\n=== RESULTS (paper money) ===")
+    if final_balance is not None:
+        print(
+            f"  Strategy:     {STARTING_CASH:,.2f} -> {final_balance:,.2f} USDT "
+            f"({strat_ret:+.2%})"
+        )
+    else:
+        print("  Strategy:     (could not read final balance)")
+    print(
+        f"  Buy & Hold:   {STARTING_CASH:,.2f} -> {buy_hold:,.2f} USDT "
+        f"({bh_ret:+.2%})"
+    )
+    if strat_ret is not None:
+        winner = "Strategy" if strat_ret > bh_ret else "Buy & Hold"
+        print(f"  Winner:       {winner}")
+        if strat_ret < bh_ret:
+            print(
+                "  NOTE: just holding beat the bot on this data. "
+                "That is NORMAL — most strategies do. Do not go live on this."
+            )
+
+    print(
+        f"  Risk events:  stop-loss/take-profit fires={strategy.stops_hit}, "
+        f"daily halts={strategy.daily_halts}"
+    )
+    print(
+        f"  Guardrails:   SL={STOP_LOSS_PCT:.0%}  TP={TAKE_PROFIT_PCT:.0%}  "
+        f"daily halt={DAILY_LOSS_LIMIT_PCT:.0%}"
+    )
 
     engine.dispose()
 
     print(
         """
 HOW TO READ THIS:
-- If PnL is positive on synthetic data, that only means the code works.
-- It does NOT mean you will make money live. Markets are not this kind.
-- Next steps: try real historical CSVs, then Binance testnet, then (much later)
-  tiny real amounts with a daily loss cap.
+- Synthetic data only proves the CODE works. It is not evidence of edge.
+- If Buy & Hold beats the bot, the bot is not ready — tune or scrap the idea.
+- Next: `python fetch_data.py` for real history, then Binance testnet,
+  then (much later) tiny real amounts with a daily loss cap.
 """
     )
 
