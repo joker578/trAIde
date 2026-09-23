@@ -1,0 +1,2 @@
+nautilus_trader>=1.209.0
+python-dotenv>=1.0.0
