@@ -16,9 +16,12 @@ Local crypto trading bot starter built on **[NautilusTrader](https://github.com/
 
 | File | What it does |
 |---|---|
-| `strategies/ema_cross.py` | EMA crossover strategy **with guardrails**: stop-loss, take-profit, daily loss kill-switch |
+| `strategies/ema_cross.py` | EMA crossover strategy **with guardrails**: stop-loss, take-profit, daily loss kill-switch, **news blackout** |
 | `run_backtest.py` | **Start here.** Backtests on real CSV or synthetic data — zero keys, fake money. Compares vs buy-and-hold |
 | `fetch_data.py` | Downloads real BTCUSDT 1m history from Binance public API (no key) into `data/` |
+| `news_event_study.py` | Measures the bot's win rate **before vs after** news releases (PPI, CPI, NFP, FOMC) vs quiet days |
+| `config/news_calendar.csv` | 89 high-impact US events (official BLS + Fed schedules, UTC, DST-correct) |
+| `tests/test_news.py` | Verifies blackout, calendar, trade log, and analyzer (`python tests/test_news.py`) |
 | `run_testnet.py` | Runs the strategy on **Binance testnet** (needs free testnet keys) |
 | `.env.example` | Template for API keys (copy to `.env`, never commit `.env`) |
 
@@ -29,8 +32,25 @@ Local crypto trading bot starter built on **[NautilusTrader](https://github.com/
 | Stop-loss | 2% | Auto-exit a losing trade at −2% |
 | Take-profit | 4% | Bank a winning trade at +4% (2:1 reward:risk) |
 | Daily loss limit | 3% | If down 3% vs start of UTC day → close everything, **no new trades until tomorrow** |
+| **News blackout** | **±30 min** | **Go flat and trade nothing around PPI / CPI / NFP / FOMC releases** |
 
-Tune these in `run_backtest.py` (`STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`, `DAILY_LOSS_LIMIT_PCT`).
+Tune these in `run_backtest.py` (`STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`, `DAILY_LOSS_LIMIT_PCT`, `NEWS_BLACKOUT_MINUTES`).
+
+## News: why the blackout exists
+
+Research shows macro releases (CPI/PPI/FOMC/NFP) are where most of the market's
+movement comes from — and where retail bots get slaughtered by spreads (5–20× wider),
+slippage, and fake first moves. This bot **sits those out** instead of trying to
+out-run millisecond algos.
+
+To **measure** how a naive bot (no blackout) actually performs around news:
+
+```bash
+.venv/bin/python fetch_data.py 730            # real 2 years of 1m candles (on your machine)
+.venv/bin/python news_event_study.py --kinds PPI    # win rate: PRE vs POST vs CONTROL
+.venv/bin/python news_event_study.py                # all event kinds
+.venv/bin/python news_event_study.py --demo         # no data? verifies the pipeline only
+```
 
 ## Quickstart (backtest only, no keys needed)
 

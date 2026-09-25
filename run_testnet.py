@@ -82,6 +82,8 @@ def main() -> None:
     instrument_id = InstrumentId.from_str("BTCUSDT.BINANCE")
     bar_type = BarType.from_str("BTCUSDT.BINANCE-1-MINUTE-LAST-EXTERNAL")
 
+    calendar = Path(__file__).resolve() / "config" / "news_calendar.csv"
+
     strategy = EMACross(
         EMACrossConfig(
             instrument_id=instrument_id,
@@ -89,6 +91,9 @@ def main() -> None:
             trade_size=Decimal("0.001"),  # tiny size on testnet
             # Spot accounts cannot short — only futures may.
             allow_short=(account_type == "usdt_future"),
+            # Sit out PPI/CPI/NFP/FOMC releases
+            news_calendar_path=str(calendar) if calendar.exists() else "",
+            news_blackout_minutes=30,
         )
     )
     node.add_strategy(strategy)

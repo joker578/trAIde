@@ -45,6 +45,10 @@ STOP_LOSS_PCT = 0.02  # exit if a trade loses 2%
 TAKE_PROFIT_PCT = 0.04  # bank profit at +4% (2:1 reward:risk)
 DAILY_LOSS_LIMIT_PCT = 0.03  # halt for the day if down 3% from day start
 
+# News blackout — sit out PPI/CPI/NFP/FOMC chaos
+NEWS_CALENDAR = Path("config/news_calendar.csv")
+NEWS_BLACKOUT_MINUTES = 30
+
 
 def make_synthetic_bars(n: int = N_BARS, seed: int = 42) -> pd.DataFrame:
     """Generate a realistic-looking random walk with trending regimes."""
@@ -127,6 +131,10 @@ def main() -> None:
             stop_loss_pct=STOP_LOSS_PCT,
             take_profit_pct=TAKE_PROFIT_PCT,
             daily_loss_limit_pct=DAILY_LOSS_LIMIT_PCT,
+            news_calendar_path=(
+                str(NEWS_CALENDAR) if NEWS_CALENDAR.exists() else ""
+            ),
+            news_blackout_minutes=NEWS_BLACKOUT_MINUTES,
         )
     )
     engine.add_strategy(strategy)
@@ -167,11 +175,14 @@ def main() -> None:
 
     print(
         f"  Risk events:  stop-loss/take-profit fires={strategy.stops_hit}, "
-        f"daily halts={strategy.daily_halts}"
+        f"daily halts={strategy.daily_halts}, "
+        f"news blackouts={strategy.news_events_avoided}"
     )
     print(
         f"  Guardrails:   SL={STOP_LOSS_PCT:.0%}  TP={TAKE_PROFIT_PCT:.0%}  "
-        f"daily halt={DAILY_LOSS_LIMIT_PCT:.0%}"
+        f"daily halt={DAILY_LOSS_LIMIT_PCT:.0%}  "
+        f"news blackout=±{NEWS_BLACKOUT_MINUTES}m "
+        f"({'on' if NEWS_CALENDAR.exists() else 'calendar missing'})"
     )
 
     engine.dispose()

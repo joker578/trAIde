@@ -11,11 +11,19 @@ Guardrails (the part that keeps you solvent):
 - TAKE PROFIT: bank profit when the trade wins enough (default 2:1 reward:risk).
 - DAILY LOSS LIMIT: if the account drops too much vs the start of the UTC day,
   the strategy closes everything and stops trading until the next day.
+- NEWS BLACKOUT: if a news calendar CSV is provided, go flat and take no trades
+  within +/- N minutes of high-impact events (PPI, CPI, NFP, FOMC).
+
+Also logs every completed trade (entry/exit price + return) so tools like
+news_event_study.py can measure win rates around news.
 
 This is a learning template, NOT a guaranteed money maker.
 Always backtest + paper trade before risking real funds.
 """
 
+import bisect
+import csv
+from datetime import datetime
 from decimal import Decimal
 
 from nautilus_trader.config import StrategyConfig
@@ -28,6 +36,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
 NANOS_PER_DAY = 86_400_000_000_000
+NANOS_PER_MIN = 60_000_000_000
 
 
 class EMACrossConfig(StrategyConfig, frozen=True):
@@ -43,6 +52,9 @@ class EMACrossConfig(StrategyConfig, frozen=True):
     stop_loss_pct: float = 0.02
     take_profit_pct: float = 0.04
     daily_loss_limit_pct: float = 0.03
+    # News blackout: path to calendar CSV ("" = disabled)
+    news_calendar_path: str = ""
+    news_blackout_minutes: int = 30
 
 
 class EMACross(Strategy):
@@ -59,17 +71,63 @@ class EMACross(Strategy):
         self.stops_hit = 0
         self.daily_halts = 0
 
+        # News blackout state
+        self._news_nanos: list[int] = []  # sorted event times
+        self._active_news_nano: int | None = None  # event currently blocking
+        self.news_blacked_out_bars = 0
+        self.news_events_avoided = 0
+
+        # Trade log (completed round-trips) for event studies
+        self._open_trade: dict | None = None
+        self.closed_trades: list[dict] = []
+
     # ------------------------------------------------------------------ setup
     def on_start(self) -> None:
         self.register_indicator_for_bars(self.config.bar_type, self.fast_ema)
         self.register_indicator_for_bars(self.config.bar_type, self.slow_ema)
         self.subscribe_bars(self.config.bar_type)
+        self._load_news_calendar()
 
+    def _load_news_calendar(self) -> None:
+        path = self.config.news_calendar_path
+        if not path:
+            return
+        try:
+            with open(path, newline="") as f:
+                for row in csv.DictReader(f):
+                    ts = datetime.fromisoformat(row["timestamp"])
+                    self._news_nanos.append(int(ts.timestamp() * 1_000_000_000))
+            self._news_nanos.sort()
+            self.log.info(
+                f"News calendar loaded: {len(self._news_nanos)} events from {path} "
+                f"(+/- {self.config.news_blackout_minutes} min blackout)"
+            )
+        except OSError as exc:
+            self.log.error(f"Could not load news calendar '{path}': {exc}")
+
+    def _news_event_near(self, ts: int) -> int | None:
+        """Return the event nanos if ts is inside a blackout window, else None."""
+        if not self._news_nanos:
+            return None
+        margin = self.config.news_blackout_minutes * NANOS_PER_MIN
+        i = bisect.bisect_left(self._news_nanos, ts - margin)
+        if i < len(self._news_nanos) and self._news_nanos[i] <= ts + margin:
+            return self._news_nanos[i]
+        return None
+
+    # ----------------------------------------------------------- trade log
     def on_order_filled(self, fill: OrderFilled) -> None:
         if fill.instrument_id != self.config.instrument_id:
             return
-        # Only remember an entry price when we are actually holding a position
-        # (a sell that merely CLOSES a long must not be recorded as a short entry).
+
+        commission = 0.0
+        if fill.commission is not None:
+            try:
+                commission = float(fill.commission)
+            except (TypeError, ValueError):
+                commission = 0.0
+
+        # Entry-price tracking for SL/TP
         if self.portfolio.is_net_long(self.config.instrument_id) and fill.is_buy:
             self._long_entry = float(fill.last_px)
             self._short_entry = None
@@ -79,6 +137,38 @@ class EMACross(Strategy):
         elif self.portfolio.is_flat(self.config.instrument_id):
             self._long_entry = None
             self._short_entry = None
+
+        # Round-trip trade log
+        flat = self.portfolio.is_flat(self.config.instrument_id)
+        long_ = self.portfolio.is_net_long(self.config.instrument_id)
+        short_ = self.portfolio.is_net_short(self.config.instrument_id)
+
+        if self._open_trade is None:
+            if long_ or short_:
+                self._open_trade = {
+                    "side": "LONG" if long_ else "SHORT",
+                    "entry_px": float(fill.last_px),
+                    "entry_ts": fill.ts_event,
+                    "commission": commission,
+                }
+        else:
+            self._open_trade["commission"] += commission
+            if flat:
+                exit_px = float(fill.last_px)
+                entry = self._open_trade["entry_px"]
+                if self._open_trade["side"] == "LONG":
+                    ret = exit_px / entry - 1.0
+                else:
+                    ret = entry / exit_px - 1.0
+                self.closed_trades.append(
+                    {
+                        **self._open_trade,
+                        "exit_px": exit_px,
+                        "exit_ts": fill.ts_event,
+                        "return_pct": ret,
+                    }
+                )
+                self._open_trade = None
 
     # ------------------------------------------------------------ risk layer
     def _equity(self) -> float:
@@ -156,9 +246,32 @@ class EMACross(Strategy):
 
         return False
 
+    def _apply_news_blackout(self, bar: Bar) -> bool:
+        """True = we are inside a news blackout window (no trading allowed)."""
+        event = self._news_event_near(bar.ts_event)
+        if event is None:
+            self._active_news_nano = None
+            return False
+        if self._active_news_nano != event:
+            self._active_news_nano = event
+            self.news_events_avoided += 1
+            when = datetime.utcfromtimestamp(event / 1_000_000_000)
+            self.log.warning(
+                f"NEWS BLACKOUT active around {when.isoformat()}Z — "
+                "closing positions, no new trades."
+            )
+        self.news_blacked_out_bars += 1
+        if not self.portfolio.is_flat(self.config.instrument_id):
+            self.close_all_positions(self.config.instrument_id)
+        return True
+
     # ----------------------------------------------------------- main logic
     def on_bar(self, bar: Bar) -> None:
         if not self.indicators_initialized():
+            return
+
+        # News blackout is checked FIRST — it overrides everything.
+        if self._apply_news_blackout(bar):
             return
 
         self._update_daily_state(bar)
@@ -169,7 +282,7 @@ class EMACross(Strategy):
                 self.close_all_positions(self.config.instrument_id)
             return
 
-        # Guardrails first — they override the signal.
+        # Guardrails — they override the signal.
         if self._check_stop_loss_and_take_profit(bar):
             return
 
@@ -212,6 +325,7 @@ class EMACross(Strategy):
     def on_stop(self) -> None:
         self.close_all_positions(self.config.instrument_id)
         self.log.info(
-            f"Stopped. stop_loss_events={self.stops_hit} "
-            f"daily_halts={self.daily_halts}"
+            f"Stopped. news_blackout_bars={self.news_blacked_out_bars} "
+            f"news_events_avoided={self.news_events_avoided} "
+            f"closed_trades={len(self.closed_trades)}"
         )
