@@ -30,11 +30,18 @@ Local crypto trading bot starter built on **[NautilusTrader](https://github.com/
 | Control | Default | What it does |
 |---|---|---|
 | Stop-loss | 2% | Auto-exit a losing trade at −2% |
-| Take-profit | 4% | Bank a winning trade at +4% (2:1 reward:risk) |
+| Trailing stop | 1.5% | Exit trails the best price reached — **lets winners run** (fixed 4% TP is the fallback) |
+| Position risk | **1% of equity** | Every trade risks exactly 1% of the account (fixed-fractional sizing), notional capped at 50% |
 | Daily loss limit | 3% | If down 3% vs start of UTC day → close everything, **no new trades until tomorrow** |
 | **News blackout** | **±30 min** | **Go flat and trade nothing around PPI / CPI / NFP / FOMC releases** |
+| Costs in backtest | **0.10%/side + 1 tick slippage** | Backtests are **net of fees** — no more fake profits |
 
-Tune these in `run_backtest.py` (`STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`, `DAILY_LOSS_LIMIT_PCT`, `NEWS_BLACKOUT_MINUTES`).
+**The scoreboard metric is EXPECTANCY per trade (net of fees), not win rate.**
+A 40% win rate with 3:1 reward:risk beats 90% with 1:10. The backtest prints
+expectancy, profit factor, and avg win/loss — win rate is shown as the
+"vanity metric" it is.
+
+Tune these in `run_backtest.py`.
 
 ## News: why the blackout exists
 

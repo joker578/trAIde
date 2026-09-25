@@ -20,6 +20,8 @@ import numpy as np
 import pandas as pd
 
 from nautilus_trader.backtest.engine import BacktestEngine
+from nautilus_trader.backtest.models import MakerTakerFeeModel
+from nautilus_trader.backtest.models import OneTickSlippageFillModel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.model.currencies import USDT
@@ -42,8 +44,17 @@ CSV_PATH = Path("data/btcusdt_1m.csv")
 
 # Risk guardrails — tune carefully, these are your seatbelt
 STOP_LOSS_PCT = 0.02  # exit if a trade loses 2%
-TAKE_PROFIT_PCT = 0.04  # bank profit at +4% (2:1 reward:risk)
+TRAILING_STOP_PCT = 0.015  # trail winners by 1.5% from best price (0 = fixed TP)
+TAKE_PROFIT_PCT = 0.04  # only used when TRAILING_STOP_PCT == 0
 DAILY_LOSS_LIMIT_PCT = 0.03  # halt for the day if down 3% from day start
+
+# Position sizing: risk a fixed % of equity per trade (the ONLY sane way)
+RISK_PER_TRADE_PCT = 0.01  # max loss if stopped = 1% of equity
+MAX_NOTIONAL_FRAC = 0.5  # never deploy more than 50% of equity as notional
+
+# Honest costs (these make backtests stop lying)
+TAKER_FEE = 0.001  # 0.10% per side — Binance spot/VIP0 taker
+SLIPPAGE_TICKS = 1  # every fill gets 1 tick of slippage
 
 # News blackout — sit out PPI/CPI/NFP/FOMC chaos
 NEWS_CALENDAR = Path("config/news_calendar.csv")
@@ -113,6 +124,10 @@ def main() -> None:
         account_type=AccountType.MARGIN,
         starting_balances=[Money(STARTING_CASH, USDT)],
         base_currency=USDT,
+        # HONEST COSTS: 0.1%/side fees (instrument maker/taker=0.001)
+        # + 1 tick of slippage on every fill. Without these, backtests lie.
+        fee_model=MakerTakerFeeModel(),
+        fill_model=OneTickSlippageFillModel(),
     )
     engine.add_instrument(instrument)
 
@@ -130,7 +145,11 @@ def main() -> None:
             allow_short=True,  # simulation only; live spot should be False
             stop_loss_pct=STOP_LOSS_PCT,
             take_profit_pct=TAKE_PROFIT_PCT,
+            trailing_stop_pct=TRAILING_STOP_PCT,
             daily_loss_limit_pct=DAILY_LOSS_LIMIT_PCT,
+            risk_per_trade_pct=RISK_PER_TRADE_PCT,
+            max_notional_frac=MAX_NOTIONAL_FRAC,
+            use_risk_sizing=True,
             news_calendar_path=(
                 str(NEWS_CALENDAR) if NEWS_CALENDAR.exists() else ""
             ),
@@ -142,17 +161,34 @@ def main() -> None:
     print("Running backtest...")
     engine.run()
 
-    # --- Results -------------------------------------------------------
+    # --- Results (expectancy scoreboard — win rate is secondary) -----
+    trades = strategy.closed_trades
+    nets = [t["return_pct"] for t in trades]
+    wins = [r for r in nets if r > 0]
+    losses = [r for r in nets if r <= 0]
+    expectancy = float(np.mean(nets)) if nets else None
+    avg_win = float(np.mean(wins)) if wins else None
+    avg_loss = float(np.mean(losses)) if losses else None
+    profit_factor = (
+        (sum(wins) / abs(sum(losses))) if wins and losses and sum(losses) != 0 else None
+    )
+    win_rate = (len(wins) / len(nets)) if nets else None
+    rr = (abs(avg_win / avg_loss)) if avg_win and avg_loss else None
+
     first_close = float(bars_df["close"].iloc[0])
     last_close = float(bars_df["close"].iloc[-1])
-    buy_hold = STARTING_CASH * (last_close / first_close)
+    # Buy & Hold net of one 0.1% entry fee (fair vs strategy which pays fees)
+    buy_hold = STARTING_CASH * (last_close / first_close) * (1.0 - TAKER_FEE)
     final_balance = final_usdt_balance(engine)
     strat_ret = (
         (final_balance / STARTING_CASH - 1.0) if final_balance is not None else None
     )
     bh_ret = buy_hold / STARTING_CASH - 1.0
 
-    print("\n=== RESULTS (paper money) ===")
+    print("\n=== RESULTS (paper money, AFTER fees + slippage) ===")
+    print(
+        f"  Costs modeled: taker fee {TAKER_FEE:.2%}/side + {SLIPPAGE_TICKS} tick slippage/fill"
+    )
     if final_balance is not None:
         print(
             f"  Strategy:     {STARTING_CASH:,.2f} -> {final_balance:,.2f} USDT "
@@ -162,7 +198,7 @@ def main() -> None:
         print("  Strategy:     (could not read final balance)")
     print(
         f"  Buy & Hold:   {STARTING_CASH:,.2f} -> {buy_hold:,.2f} USDT "
-        f"({bh_ret:+.2%})"
+        f"({bh_ret:+.2%}) [net of 1 entry fee]"
     )
     if strat_ret is not None:
         winner = "Strategy" if strat_ret > bh_ret else "Buy & Hold"
@@ -173,15 +209,43 @@ def main() -> None:
                 "That is NORMAL — most strategies do. Do not go live on this."
             )
 
+    print("\n--- Trade quality scoreboard (THE numbers that matter) ---")
+    print(f"  Trades:            {len(nets)}")
+    if expectancy is not None:
+        print(f"  EXPECTANCY/trade:  {expectancy:+.4%}  <- the target metric")
+        print(
+            f"  Avg win:           {avg_win:+.4%}   Avg loss: {avg_loss:+.4%}"
+            if avg_win is not None and avg_loss is not None
+            else ""
+        )
+        print(
+            f"  Profit factor:     {profit_factor:.2f}"
+            if profit_factor is not None
+            else "  Profit factor:     n/a (need wins and losses)"
+        )
+        print(f"  Reward:risk (avg): {rr:.2f}" if rr else "")
+        print(f"  Win rate:          {win_rate:.1%}  (secondary — vanity metric)")
+        verdict = (
+            "POSITIVE edge (before costs of doubt: fees modeled)"
+            if expectancy > 0
+            else "NEGATIVE edge — this data says the bot loses. Do not go live."
+        )
+        print(f"  Verdict:           {verdict}")
+    else:
+        print("  No completed trades — nothing to measure.")
+
     print(
-        f"  Risk events:  stop-loss/take-profit fires={strategy.stops_hit}, "
+        f"\n  Risk events:  stops={strategy.stops_hit}, "
+        f"trailing exits={strategy.trailing_exits}, "
         f"daily halts={strategy.daily_halts}, "
         f"news blackouts={strategy.news_events_avoided}"
     )
     print(
-        f"  Guardrails:   SL={STOP_LOSS_PCT:.0%}  TP={TAKE_PROFIT_PCT:.0%}  "
+        f"  Guardrails:   SL={STOP_LOSS_PCT:.0%}  "
+        f"trail={TRAILING_STOP_PCT:.0%}  "
+        f"risk/trade={RISK_PER_TRADE_PCT:.0%}  "
         f"daily halt={DAILY_LOSS_LIMIT_PCT:.0%}  "
-        f"news blackout=±{NEWS_BLACKOUT_MINUTES}m "
+        f"news=±{NEWS_BLACKOUT_MINUTES}m "
         f"({'on' if NEWS_CALENDAR.exists() else 'calendar missing'})"
     )
 
@@ -190,10 +254,10 @@ def main() -> None:
     print(
         """
 HOW TO READ THIS:
-- Synthetic data only proves the CODE works. It is not evidence of edge.
-- If Buy & Hold beats the bot, the bot is not ready — tune or scrap the idea.
-- Next: `python fetch_data.py` for real history, then Binance testnet,
-  then (much later) tiny real amounts with a daily loss cap.
+- The target metric is EXPECTANCY per trade (net of fees). Positive = edge.
+- Win rate is secondary: 40% win rate with 3:1 R:R beats 90% with 1:10.
+- Synthetic data only proves the CODE works — not that edge exists.
+- Next: real CSV (fetch_data.py), then walk-forward, then testnet.
 """
     )
 

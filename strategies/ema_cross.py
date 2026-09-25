@@ -8,14 +8,16 @@ How it works (kid version):
 
 Guardrails (the part that keeps you solvent):
 - STOP LOSS: exit automatically if the trade loses too much.
-- TAKE PROFIT: bank profit when the trade wins enough (default 2:1 reward:risk).
-- DAILY LOSS LIMIT: if the account drops too much vs the start of the UTC day,
-  the strategy closes everything and stops trading until the next day.
-- NEWS BLACKOUT: if a news calendar CSV is provided, go flat and take no trades
-  within +/- N minutes of high-impact events (PPI, CPI, NFP, FOMC).
+- TRAILING STOP: once a trade is in profit, the exit trails behind the best
+  price reached (lets winners run) — fixed take-profit is the fallback.
+- POSITION RISK: every trade risks a fixed % of equity (default 1%).
+  Size = risk_amount / stop_distance, capped so one trade never exceeds
+  max_notional_frac of the account.
+- DAILY LOSS LIMIT: down too much vs start of UTC day -> flat until tomorrow.
+- NEWS BLACKOUT: +/- N minutes around PPI/CPI/NFP/FOMC -> flat, no trades.
 
-Also logs every completed trade (entry/exit price + return) so tools like
-news_event_study.py can measure win rates around news.
+Logs every completed trade (qty, fees, net return) — the scoreboard uses
+EXPECTANCY (avg net edge per trade), not win rate.
 
 This is a learning template, NOT a guaranteed money maker.
 Always backtest + paper trade before risking real funds.
@@ -37,22 +39,29 @@ from nautilus_trader.trading.strategy import Strategy
 
 NANOS_PER_DAY = 86_400_000_000_000
 NANOS_PER_MIN = 60_000_000_000
+BINANCE_MIN_NOTIONAL_USDT = 10.0
 
 
 class EMACrossConfig(StrategyConfig, frozen=True):
     instrument_id: InstrumentId
     bar_type: BarType
-    trade_size: Decimal
+    trade_size: Decimal  # fallback fixed size if risk sizing is disabled
     fast_ema_period: int = 10
     slow_ema_period: int = 20
     # False = spot mode: only trade what you own (no shorting).
     # True = margin/futures mode: allowed to bet against the market too.
     allow_short: bool = True
-    # Risk guardrails (as fractions: 0.02 = 2%)
+    # --- Risk guardrails (fractions: 0.02 = 2%) ---
     stop_loss_pct: float = 0.02
-    take_profit_pct: float = 0.04
+    take_profit_pct: float = 0.04  # used only when trailing_stop_pct == 0
     daily_loss_limit_pct: float = 0.03
-    # News blackout: path to calendar CSV ("" = disabled)
+    # --- Position sizing: fixed-fractional (risk X% of equity per trade) ---
+    risk_per_trade_pct: float = 0.01  # lose at most 1% of equity if stopped
+    max_notional_frac: float = 0.5  # never use more than 50% of equity notional
+    use_risk_sizing: bool = True
+    # --- Trailing stop (lets winners run; 0 = use fixed take-profit) ---
+    trailing_stop_pct: float = 0.015
+    # --- News blackout ---
     news_calendar_path: str = ""
     news_blackout_minutes: int = 30
 
@@ -65,19 +74,22 @@ class EMACross(Strategy):
 
         self._long_entry: float | None = None
         self._short_entry: float | None = None
+        self._trail_peak: float | None = None  # best price since entry (long)
+        self._trail_trough: float | None = None  # worst price since entry (short)
         self._day_index: int | None = None
         self._day_start_equity: float | None = None
         self._halted_today: bool = False
         self.stops_hit = 0
+        self.trailing_exits = 0
         self.daily_halts = 0
 
         # News blackout state
-        self._news_nanos: list[int] = []  # sorted event times
-        self._active_news_nano: int | None = None  # event currently blocking
+        self._news_nanos: list[int] = []
+        self._active_news_nano: int | None = None
         self.news_blacked_out_bars = 0
         self.news_events_avoided = 0
 
-        # Trade log (completed round-trips) for event studies
+        # Trade log (completed round-trips) for the expectancy scoreboard
         self._open_trade: dict | None = None
         self.closed_trades: list[dict] = []
 
@@ -106,7 +118,6 @@ class EMACross(Strategy):
             self.log.error(f"Could not load news calendar '{path}': {exc}")
 
     def _news_event_near(self, ts: int) -> int | None:
-        """Return the event nanos if ts is inside a blackout window, else None."""
         if not self._news_nanos:
             return None
         margin = self.config.news_blackout_minutes * NANOS_PER_MIN
@@ -127,18 +138,24 @@ class EMACross(Strategy):
             except (TypeError, ValueError):
                 commission = 0.0
 
-        # Entry-price tracking for SL/TP
+        # Entry-price tracking for SL/TP/trailing
         if self.portfolio.is_net_long(self.config.instrument_id) and fill.is_buy:
             self._long_entry = float(fill.last_px)
             self._short_entry = None
+            self._trail_peak = float(fill.last_px)
+            self._trail_trough = None
         elif self.portfolio.is_net_short(self.config.instrument_id) and fill.is_sell:
             self._short_entry = float(fill.last_px)
             self._long_entry = None
+            self._trail_trough = float(fill.last_px)
+            self._trail_peak = None
         elif self.portfolio.is_flat(self.config.instrument_id):
             self._long_entry = None
             self._short_entry = None
+            self._trail_peak = None
+            self._trail_trough = None
 
-        # Round-trip trade log
+        # Round-trip trade log (fees included so expectancy can be net)
         flat = self.portfolio.is_flat(self.config.instrument_id)
         long_ = self.portfolio.is_net_long(self.config.instrument_id)
         short_ = self.portfolio.is_net_short(self.config.instrument_id)
@@ -149,6 +166,7 @@ class EMACross(Strategy):
                     "side": "LONG" if long_ else "SHORT",
                     "entry_px": float(fill.last_px),
                     "entry_ts": fill.ts_event,
+                    "qty": float(fill.last_qty),
                     "commission": commission,
                 }
         else:
@@ -157,15 +175,21 @@ class EMACross(Strategy):
                 exit_px = float(fill.last_px)
                 entry = self._open_trade["entry_px"]
                 if self._open_trade["side"] == "LONG":
-                    ret = exit_px / entry - 1.0
+                    gross = exit_px / entry - 1.0
                 else:
-                    ret = entry / exit_px - 1.0
+                    gross = entry / exit_px - 1.0
+                notional = entry * self._open_trade["qty"]
+                fee_frac = (
+                    self._open_trade["commission"] / notional if notional > 0 else 0.0
+                )
                 self.closed_trades.append(
                     {
                         **self._open_trade,
                         "exit_px": exit_px,
                         "exit_ts": fill.ts_event,
-                        "return_pct": ret,
+                        "gross_pct": gross,
+                        "fee_frac": fee_frac,
+                        "return_pct": gross - fee_frac,  # NET of fees
                     }
                 )
                 self._open_trade = None
@@ -202,52 +226,78 @@ class EMACross(Strategy):
                 self.close_all_positions(self.config.instrument_id)
 
     def _check_stop_loss_and_take_profit(self, bar: Bar) -> bool:
-        """Return True if a guardrail fired (caller should not re-enter this bar)."""
+        """Hard SL, then trailing/fixed exit. True = fired (no re-entry)."""
         close = float(bar.close)
         instrument = self.config.instrument_id
+        trail = self.config.trailing_stop_pct
 
         if self.portfolio.is_net_long(instrument) and self._long_entry:
-            stop = self._long_entry * (1.0 - self.config.stop_loss_pct)
-            target = self._long_entry * (1.0 + self.config.take_profit_pct)
-            if close <= stop:
+            hard_stop = self._long_entry * (1.0 - self.config.stop_loss_pct)
+            if close <= hard_stop:
                 self.stops_hit += 1
                 self.log.warning(
                     f"STOP LOSS (long) entry={self._long_entry:.2f} "
-                    f"close={close:.2f} stop={stop:.2f}"
-                )
-                self.close_all_positions(instrument)
-                return True
-            if close >= target:
-                self.log.info(
-                    f"TAKE PROFIT (long) entry={self._long_entry:.2f} "
-                    f"close={close:.2f} target={target:.2f}"
+                    f"close={close:.2f} stop={hard_stop:.2f}"
                 )
                 self.close_all_positions(instrument)
                 return True
 
+            if trail > 0.0 and self._trail_peak is not None:
+                self._trail_peak = max(self._trail_peak, close)
+                trail_stop = self._trail_peak * (1.0 - trail)
+                if close <= trail_stop and trail_stop > hard_stop:
+                    self.trailing_exits += 1
+                    self.log.info(
+                        f"TRAIL STOP (long) peak={self._trail_peak:.2f} "
+                        f"close={close:.2f} trail={trail_stop:.2f}"
+                    )
+                    self.close_all_positions(instrument)
+                    return True
+            elif trail == 0.0:
+                target = self._long_entry * (1.0 + self.config.take_profit_pct)
+                if close >= target:
+                    self.log.info(
+                        f"TAKE PROFIT (long) entry={self._long_entry:.2f} "
+                        f"close={close:.2f} target={target:.2f}"
+                    )
+                    self.close_all_positions(instrument)
+                    return True
+
         if self.portfolio.is_net_short(instrument) and self._short_entry:
-            stop = self._short_entry * (1.0 + self.config.stop_loss_pct)
-            target = self._short_entry * (1.0 - self.config.take_profit_pct)
-            if close >= stop:
+            hard_stop = self._short_entry * (1.0 + self.config.stop_loss_pct)
+            if close >= hard_stop:
                 self.stops_hit += 1
                 self.log.warning(
                     f"STOP LOSS (short) entry={self._short_entry:.2f} "
-                    f"close={close:.2f} stop={stop:.2f}"
+                    f"close={close:.2f} stop={hard_stop:.2f}"
                 )
                 self.close_all_positions(instrument)
                 return True
-            if close <= target:
-                self.log.info(
-                    f"TAKE PROFIT (short) entry={self._short_entry:.2f} "
-                    f"close={close:.2f} target={target:.2f}"
-                )
-                self.close_all_positions(instrument)
-                return True
+
+            if trail > 0.0 and self._trail_trough is not None:
+                self._trail_trough = min(self._trail_trough, close)
+                trail_stop = self._trail_trough * (1.0 + trail)
+                if close >= trail_stop and trail_stop < hard_stop:
+                    self.trailing_exits += 1
+                    self.log.info(
+                        f"TRAIL STOP (short) trough={self._trail_trough:.2f} "
+                        f"close={close:.2f} trail={trail_stop:.2f}"
+                    )
+                    self.close_all_positions(instrument)
+                    return True
+            elif trail == 0.0:
+                target = self._short_entry * (1.0 - self.config.take_profit_pct)
+                if close <= target:
+                    self.log.info(
+                        f"TAKE PROFIT (short) entry={self._short_entry:.2f} "
+                        f"close={close:.2f} target={target:.2f}"
+                    )
+                    self.close_all_positions(instrument)
+                    return True
 
         return False
 
     def _apply_news_blackout(self, bar: Bar) -> bool:
-        """True = we are inside a news blackout window (no trading allowed)."""
         event = self._news_event_near(bar.ts_event)
         if event is None:
             self._active_news_nano = None
@@ -265,6 +315,38 @@ class EMACross(Strategy):
             self.close_all_positions(self.config.instrument_id)
         return True
 
+    # ------------------------------------------------------- position sizing
+    def _trade_qty(self, price: float) -> Decimal | None:
+        """
+        Fixed-fractional sizing: risk exactly risk_per_trade_pct of equity
+        on this trade (loss if stopped = risk amount). Capped by max notional.
+        """
+        instrument = self.cache.instrument(self.config.instrument_id)
+        if not self.config.use_risk_sizing:
+            qty = instrument.make_qty(self.config.trade_size)
+            if float(qty) * price < BINANCE_MIN_NOTIONAL_USDT:
+                return None
+            return qty
+
+        equity = self._equity()
+        if equity <= 0:
+            return None
+        stop_dist = price * self.config.stop_loss_pct
+        if stop_dist <= 0:
+            return None
+
+        risk_usdt = equity * self.config.risk_per_trade_pct
+        qty_f = risk_usdt / stop_dist
+        max_qty = (equity * self.config.max_notional_frac) / price
+        qty_f = min(qty_f, max_qty)
+
+        qty = instrument.make_qty(Decimal(str(qty_f)))
+        if qty <= 0:
+            return None
+        if float(qty) * price < BINANCE_MIN_NOTIONAL_USDT:
+            return None  # below exchange min notional — skip, not a free trade
+        return qty
+
     # ----------------------------------------------------------- main logic
     def on_bar(self, bar: Bar) -> None:
         if not self.indicators_initialized():
@@ -276,49 +358,53 @@ class EMACross(Strategy):
 
         self._update_daily_state(bar)
 
-        # Kill switch active: stay flat, no new signals.
         if self._halted_today:
             if not self.portfolio.is_flat(self.config.instrument_id):
                 self.close_all_positions(self.config.instrument_id)
             return
 
-        # Guardrails — they override the signal.
         if self._check_stop_loss_and_take_profit(bar):
             return
+
+        price = float(bar.close)
 
         # EMA crossover signal
         if self.fast_ema.value >= self.slow_ema.value:
             if self.portfolio.is_flat(self.config.instrument_id):
-                self.buy()
+                self.buy(price)
             elif self.portfolio.is_net_short(self.config.instrument_id):
                 self.close_all_positions(self.config.instrument_id)
-                self.buy()
+                self.buy(price)
         elif self.fast_ema.value < self.slow_ema.value:
             if self.portfolio.is_net_long(self.config.instrument_id):
                 self.close_all_positions(self.config.instrument_id)
                 if self.config.allow_short:
-                    self.sell()
+                    self.sell(price)
             elif self.config.allow_short and self.portfolio.is_flat(
                 self.config.instrument_id
             ):
-                self.sell()
+                self.sell(price)
 
     # ------------------------------------------------------------- orders
-    def buy(self) -> None:
-        instrument = self.cache.instrument(self.config.instrument_id)
+    def buy(self, price: float) -> None:
+        qty = self._trade_qty(price)
+        if qty is None:
+            return
         order = self.order_factory.market(
             self.config.instrument_id,
             OrderSide.BUY,
-            instrument.make_qty(self.config.trade_size),
+            qty,
         )
         self.submit_order(order)
 
-    def sell(self) -> None:
-        instrument = self.cache.instrument(self.config.instrument_id)
+    def sell(self, price: float) -> None:
+        qty = self._trade_qty(price)
+        if qty is None:
+            return
         order = self.order_factory.market(
             self.config.instrument_id,
             OrderSide.SELL,
-            instrument.make_qty(self.config.trade_size),
+            qty,
         )
         self.submit_order(order)
 

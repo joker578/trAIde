@@ -37,6 +37,8 @@ import numpy as np
 import pandas as pd
 
 from nautilus_trader.backtest.engine import BacktestEngine
+from nautilus_trader.backtest.models import MakerTakerFeeModel
+from nautilus_trader.backtest.models import OneTickSlippageFillModel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.model.currencies import USDT
@@ -119,6 +121,8 @@ def run_window(window_df: pd.DataFrame, tag: str) -> list[dict]:
         account_type=AccountType.MARGIN,
         starting_balances=[Money(STARTING_CASH, USDT)],
         base_currency=USDT,
+        fee_model=MakerTakerFeeModel(),  # 0.1%/side — same honest costs as backtest
+        fill_model=OneTickSlippageFillModel(),
     )
     engine.add_instrument(instrument)
     bars = BarDataWrangler(bar_type, instrument).process(window_df)
