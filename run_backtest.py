@@ -52,6 +52,10 @@ DAILY_LOSS_LIMIT_PCT = 0.03  # halt for the day if down 3% from day start
 RISK_PER_TRADE_PCT = 0.01  # max loss if stopped = 1% of equity
 MAX_NOTIONAL_FRAC = 0.5  # never deploy more than 50% of equity as notional
 
+# Trend filter: only trade WITH the big trend (200-EMA on the same bars)
+USE_TREND_FILTER = True
+TREND_EMA_PERIOD = 200
+
 # Honest costs (these make backtests stop lying)
 TAKER_FEE = 0.001  # 0.10% per side — Binance spot/VIP0 taker
 SLIPPAGE_TICKS = 1  # every fill gets 1 tick of slippage
@@ -150,6 +154,8 @@ def main() -> None:
             risk_per_trade_pct=RISK_PER_TRADE_PCT,
             max_notional_frac=MAX_NOTIONAL_FRAC,
             use_risk_sizing=True,
+            use_trend_filter=USE_TREND_FILTER,
+            trend_ema_period=TREND_EMA_PERIOD,
             news_calendar_path=(
                 str(NEWS_CALENDAR) if NEWS_CALENDAR.exists() else ""
             ),

@@ -67,7 +67,23 @@ python3 -m venv .venv
 .venv/bin/python run_backtest.py              # synthetic data, works offline
 .venv/bin/python fetch_data.py 30             # optional: real 30-day history
 .venv/bin/python run_backtest.py              # now uses data/btcusdt_1m.csv
+.venv/bin/python walk_forward.py --data data/btcusdt_1m.csv  # honest OOS test
 ```
+
+## Walk-forward: the only backtest that can't lie
+
+`walk_forward.py` splits history into rolling train/test windows:
+
+1. On **train**: grid-search (fast/slow EMA × trend-filter on/off) by expectancy
+2. On **test**: run only the winner on unseen data (out-of-sample)
+3. Roll forward and repeat — **aggregate TEST expectancy is the honest number**
+
+Rule: if optimized OOS doesn't beat the static baseline (10/50+TF), the grid is
+curve-fitting — use static params. If most test windows aren't positive, don't
+go to testnet, let alone live.
+
+Trend filter (200-EMA): long only above, short only below — enabled by default
+in `run_backtest.py` (`USE_TREND_FILTER`).
 
 **How to judge results honestly:**
 - If the bot loses to **Buy & Hold**, it is not ready. Do not go live.

@@ -61,6 +61,9 @@ class EMACrossConfig(StrategyConfig, frozen=True):
     use_risk_sizing: bool = True
     # --- Trailing stop (lets winners run; 0 = use fixed take-profit) ---
     trailing_stop_pct: float = 0.015
+    # --- Trend filter: only trade WITH the big trend (200-EMA) ---
+    use_trend_filter: bool = False
+    trend_ema_period: int = 200
     # --- News blackout ---
     news_calendar_path: str = ""
     news_blackout_minutes: int = 30
@@ -71,6 +74,7 @@ class EMACross(Strategy):
         super().__init__(config)
         self.fast_ema = ExponentialMovingAverage(config.fast_ema_period)
         self.slow_ema = ExponentialMovingAverage(config.slow_ema_period)
+        self.trend_ema = ExponentialMovingAverage(config.trend_ema_period)
 
         self._long_entry: float | None = None
         self._short_entry: float | None = None
@@ -97,8 +101,21 @@ class EMACross(Strategy):
     def on_start(self) -> None:
         self.register_indicator_for_bars(self.config.bar_type, self.fast_ema)
         self.register_indicator_for_bars(self.config.bar_type, self.slow_ema)
+        if self.config.use_trend_filter:
+            # Only register when enabled — a 200-period warmup would
+            # otherwise delay the first signal by 200 bars for nothing.
+            self.register_indicator_for_bars(self.config.bar_type, self.trend_ema)
         self.subscribe_bars(self.config.bar_type)
         self._load_news_calendar()
+
+    def _trend_allows(self, side: str, price: float) -> bool:
+        """Trend filter: LONG only above the trend EMA, SHORT only below."""
+        if not self.config.use_trend_filter:
+            return True
+        trend = self.trend_ema.value
+        if side == "LONG":
+            return price >= trend
+        return price <= trend
 
     def _load_news_calendar(self) -> None:
         path = self.config.news_calendar_path
@@ -368,22 +385,25 @@ class EMACross(Strategy):
 
         price = float(bar.close)
 
-        # EMA crossover signal
+        # EMA crossover signal (trend filter gates ENTRIES only, never exits)
         if self.fast_ema.value >= self.slow_ema.value:
             if self.portfolio.is_flat(self.config.instrument_id):
-                self.buy(price)
+                if self._trend_allows("LONG", price):
+                    self.buy(price)
             elif self.portfolio.is_net_short(self.config.instrument_id):
                 self.close_all_positions(self.config.instrument_id)
-                self.buy(price)
+                if self._trend_allows("LONG", price):
+                    self.buy(price)
         elif self.fast_ema.value < self.slow_ema.value:
             if self.portfolio.is_net_long(self.config.instrument_id):
                 self.close_all_positions(self.config.instrument_id)
-                if self.config.allow_short:
+                if self.config.allow_short and self._trend_allows("SHORT", price):
                     self.sell(price)
             elif self.config.allow_short and self.portfolio.is_flat(
                 self.config.instrument_id
             ):
-                self.sell(price)
+                if self._trend_allows("SHORT", price):
+                    self.sell(price)
 
     # ------------------------------------------------------------- orders
     def buy(self, price: float) -> None:
