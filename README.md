@@ -14,16 +14,43 @@ Local crypto trading bot starter built on **[NautilusTrader](https://github.com/
 
 ## What's in the box
 
+## Two engines (the pro structure)
+
+| Engine | File | What it does | Evidence family |
+|---|---|---|---|
+| **Trend** | `strategies/ema_cross.py`, `strategies/tsmom.py` | Directional: long/short BTC based on trend signals | Trend following / TSMOM (137yr) |
+| **Carry** | `carry_backtest.py`, `run_carry.py` | Market-neutral: long spot + short perp, harvest funding | Carry (AQR century factor) |
+
+They earn money from **different sources** and are (mostly) uncorrelated — running
+both with separate risk budgets is the actual "quant fund" structure.
+
+```bash
+# Trend engine
+.venv/bin/python run_backtest.py                     # EMA cross (1m)
+.venv/bin/python run_backtest.py --strategy tsmom    # TSMOM + vol targeting (1h)
+
+# Carry engine
+.venv/bin/python fetch_funding.py                    # real funding history (your machine)
+.venv/bin/python carry_backtest.py --demo            # demo carry math (offline)
+.venv/bin/python run_carry.py --demo                 # monitor preview
+.venv/bin/python run_carry.py --once                 # live verdict (no keys needed)
+```
+
+## Files
+
 | File | What it does |
 |---|---|
-| `strategies/ema_cross.py` | EMA crossover strategy **with guardrails**: stop-loss, take-profit, daily loss kill-switch, **news blackout** |
-| `run_backtest.py` | **Start here.** Backtests on real CSV or synthetic data — zero keys, fake money. Compares vs buy-and-hold |
-| `fetch_data.py` | Downloads real BTCUSDT 1m history from Binance public API (no key) into `data/` |
-| `news_event_study.py` | Measures the bot's win rate **before vs after** news releases (PPI, CPI, NFP, FOMC) vs quiet days |
-| `config/news_calendar.csv` | 89 high-impact US events (official BLS + Fed schedules, UTC, DST-correct) |
-| `tests/test_news.py` | Verifies blackout, calendar, trade log, and analyzer (`python tests/test_news.py`) |
-| `run_testnet.py` | Runs the strategy on **Binance testnet** (needs free testnet keys) |
-| `.env.example` | Template for API keys (copy to `.env`, never commit `.env`) |
+| `strategies/ema_cross.py` | EMA cross + guardrails: SL, trailing stop, daily kill-switch, news blackout, **1% risk sizing** |
+| `strategies/tsmom.py` | **TSMOM**: sign-of-returns signal + **vol targeting** (20% ann. target), inherits all guardrails |
+| `run_backtest.py` | Backtester: `--strategy emacross\|tsmom`, net of fees+slippage, expectancy scoreboard |
+| `walk_forward.py` | Honest out-of-sample validator (train-select, test-validate) |
+| `fetch_data.py` / `fetch_funding.py` | Download real 1m candles / funding history (public APIs, no keys) |
+| `carry_backtest.py` | Funding carry backtest: always-on vs threshold modes, fees, droughts |
+| `run_carry.py` | Live carry **monitor** (public data, no keys) — prints OPEN/STAND ASIDE verdicts |
+| `news_event_study.py` | Bot win rate BEFORE vs AFTER PPI/CPI/NFP/FOMC vs quiet-day control |
+| `config/news_calendar.csv` | 89 official BLS+Fed events (UTC, DST-correct) |
+| `run_testnet.py` | Binance **testnet** runner (`testnet=True` hardcoded) |
+| `tests/` | 12 tests: news(4) + walk-forward(3) + tsmom/carry(5) |
 
 ## Risk guardrails (built into the strategy)
 

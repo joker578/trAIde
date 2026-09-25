@@ -2,7 +2,8 @@
 Backtest (paper money on historical data) — run this FIRST.
 
 Usage:
-    .venv/bin/python run_backtest.py
+    .venv/bin/python run_backtest.py                     # EMA cross (1m)
+    .venv/bin/python run_backtest.py --strategy tsmom    # TSMOM + vol targeting (1h)
 
 Data priority:
   1. data/btcusdt_1m.csv   — real candles from `python fetch_data.py`
@@ -13,6 +14,7 @@ No API keys. No real money. Ever.
 
 from __future__ import annotations
 
+import argparse
 from decimal import Decimal
 from pathlib import Path
 
@@ -36,6 +38,8 @@ from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 from strategies.ema_cross import EMACross
 from strategies.ema_cross import EMACrossConfig
+from strategies.tsmom import TSMOM
+from strategies.tsmom import TSMOMConfig
 
 N_BARS = 5_000  # ~3.5 days of 1-minute bars (synthetic fallback)
 STARTING_CASH = 10_000  # fake USDT
@@ -59,6 +63,15 @@ TREND_EMA_PERIOD = 200
 # Honest costs (these make backtests stop lying)
 TAKER_FEE = 0.001  # 0.10% per side — Binance spot/VIP0 taker
 SLIPPAGE_TICKS = 1  # every fill gets 1 tick of slippage
+
+# TSMOM (1h) parameters — timeframe-appropriate guardrails
+TSMOM_STOP_LOSS = 0.06  # 2% is noise on 1h; 6% is a real regime flip
+TSMOM_TRAIL = 0.04
+TSMOM_DAILY_HALT = 0.05
+TSMOM_LOOKBACK = 480  # 20 days of 1h bars
+TSMOM_VOL_WINDOW = 168  # 7 days
+TSMOM_TARGET_VOL = 0.20  # 20% annualized
+TSMOM_BARS_PER_YEAR = 8760
 
 # News blackout — sit out PPI/CPI/NFP/FOMC chaos
 NEWS_CALENDAR = Path("config/news_calendar.csv")
@@ -98,6 +111,41 @@ def load_bars() -> pd.DataFrame:
     return make_synthetic_bars()
 
 
+def load_bars_1h() -> pd.DataFrame:
+    """TSMOM runs on 1h bars: resample real 1m CSV, or synth a full year."""
+    warmup_needed = TSMOM_LOOKBACK + TSMOM_VOL_WINDOW + 100
+    if CSV_PATH.exists():
+        df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"], index_col="timestamp")
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        df = (
+            df.resample("1h")
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna()
+        )
+        if len(df) < warmup_needed:
+            raise SystemExit(
+                f"TSMOM needs >={warmup_needed} 1h bars (~"
+                f"{warmup_needed // 24} days) but CSV only covers {len(df)}. "
+                "Run: .venv/bin/python fetch_data.py 60"
+            )
+        print(f"Using REAL candles from {CSV_PATH} -> resampled 1h ({len(df):,} bars)")
+        return df
+    print("No CSV found — using SYNTHETIC 1h candles for 365 days (offline demo).")
+    from walk_forward import make_synthetic_1h
+
+    return make_synthetic_1h(365)
+
+
 def final_usdt_balance(engine: BacktestEngine) -> float | None:
     try:
         report = engine.trader.generate_account_report(Venue("BINANCE"))
@@ -110,8 +158,33 @@ def final_usdt_balance(engine: BacktestEngine) -> float | None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="trAIde backtester")
+    parser.add_argument(
+        "--strategy",
+        choices=["emacross", "tsmom"],
+        default="emacross",
+        help="emacross = EMA cross (1m); tsmom = time-series momentum + vol targeting (1h)",
+    )
+    args = parser.parse_args()
+    is_tsmom = args.strategy == "tsmom"
+
     instrument = TestInstrumentProvider.btcusdt_binance()
-    bar_type = BarType.from_str("BTCUSDT.BINANCE-1-MINUTE-LAST-EXTERNAL")
+    if is_tsmom:
+        bar_type = BarType.from_str("BTCUSDT.BINANCE-1-HOUR-LAST-EXTERNAL")
+        sl_pct, trail_pct, daily_pct = (
+            TSMOM_STOP_LOSS,
+            TSMOM_TRAIL,
+            TSMOM_DAILY_HALT,
+        )
+        bar_label = "1-hour"
+    else:
+        bar_type = BarType.from_str("BTCUSDT.BINANCE-1-MINUTE-LAST-EXTERNAL")
+        sl_pct, trail_pct, daily_pct = (
+            STOP_LOSS_PCT,
+            TRAILING_STOP_PCT,
+            DAILY_LOSS_LIMIT_PCT,
+        )
+        bar_label = "1-minute"
 
     engine = BacktestEngine(
         config=BacktestEngineConfig(
@@ -135,36 +208,58 @@ def main() -> None:
     )
     engine.add_instrument(instrument)
 
-    bars_df = load_bars()
+    bars_df = load_bars_1h() if is_tsmom else load_bars()
     wrangler = BarDataWrangler(bar_type, instrument)
     bars = wrangler.process(bars_df)
     engine.add_data(bars)
-    print(f"Loaded {len(bars):,} 1-minute bars (fake money only)")
+    print(f"Loaded {len(bars):,} {bar_label} bars (fake money only)")
 
-    strategy = EMACross(
-        EMACrossConfig(
-            instrument_id=instrument.id,
-            bar_type=bar_type,
-            trade_size=TRADE_SIZE,
-            allow_short=True,  # simulation only; live spot should be False
-            stop_loss_pct=STOP_LOSS_PCT,
-            take_profit_pct=TAKE_PROFIT_PCT,
-            trailing_stop_pct=TRAILING_STOP_PCT,
-            daily_loss_limit_pct=DAILY_LOSS_LIMIT_PCT,
-            risk_per_trade_pct=RISK_PER_TRADE_PCT,
-            max_notional_frac=MAX_NOTIONAL_FRAC,
-            use_risk_sizing=True,
-            use_trend_filter=USE_TREND_FILTER,
-            trend_ema_period=TREND_EMA_PERIOD,
-            news_calendar_path=(
-                str(NEWS_CALENDAR) if NEWS_CALENDAR.exists() else ""
-            ),
-            news_blackout_minutes=NEWS_BLACKOUT_MINUTES,
+    news_path = str(NEWS_CALENDAR) if NEWS_CALENDAR.exists() else ""
+    if is_tsmom:
+        strategy = TSMOM(
+            TSMOMConfig(
+                instrument_id=instrument.id,
+                bar_type=bar_type,
+                trade_size=TRADE_SIZE,
+                allow_short=True,
+                stop_loss_pct=sl_pct,
+                trailing_stop_pct=trail_pct,
+                daily_loss_limit_pct=daily_pct,
+                max_notional_frac=MAX_NOTIONAL_FRAC,
+                lookback_bars=TSMOM_LOOKBACK,
+                vol_window_bars=TSMOM_VOL_WINDOW,
+                target_annual_vol=TSMOM_TARGET_VOL,
+                bars_per_year=TSMOM_BARS_PER_YEAR,
+                use_vol_sizing=True,
+                news_calendar_path=news_path,
+                news_blackout_minutes=NEWS_BLACKOUT_MINUTES,
+            )
         )
-    )
+        sizing_desc = f"vol target={TSMOM_TARGET_VOL:.0%} (lookback {TSMOM_LOOKBACK} bars)"
+    else:
+        strategy = EMACross(
+            EMACrossConfig(
+                instrument_id=instrument.id,
+                bar_type=bar_type,
+                trade_size=TRADE_SIZE,
+                allow_short=True,  # simulation only; live spot should be False
+                stop_loss_pct=sl_pct,
+                take_profit_pct=TAKE_PROFIT_PCT,
+                trailing_stop_pct=trail_pct,
+                daily_loss_limit_pct=daily_pct,
+                risk_per_trade_pct=RISK_PER_TRADE_PCT,
+                max_notional_frac=MAX_NOTIONAL_FRAC,
+                use_risk_sizing=True,
+                use_trend_filter=USE_TREND_FILTER,
+                trend_ema_period=TREND_EMA_PERIOD,
+                news_calendar_path=news_path,
+                news_blackout_minutes=NEWS_BLACKOUT_MINUTES,
+            )
+        )
+        sizing_desc = f"risk/trade={RISK_PER_TRADE_PCT:.0%}"
     engine.add_strategy(strategy)
 
-    print("Running backtest...")
+    print(f"Running backtest [{args.strategy.upper()}]...")
     engine.run()
 
     # --- Results (expectancy scoreboard — win rate is secondary) -----
@@ -191,7 +286,7 @@ def main() -> None:
     )
     bh_ret = buy_hold / STARTING_CASH - 1.0
 
-    print("\n=== RESULTS (paper money, AFTER fees + slippage) ===")
+    print(f"\n=== RESULTS [{args.strategy.upper()}] (paper money, AFTER fees + slippage) ===")
     print(
         f"  Costs modeled: taker fee {TAKER_FEE:.2%}/side + {SLIPPAGE_TICKS} tick slippage/fill"
     )
@@ -247,10 +342,10 @@ def main() -> None:
         f"news blackouts={strategy.news_events_avoided}"
     )
     print(
-        f"  Guardrails:   SL={STOP_LOSS_PCT:.0%}  "
-        f"trail={TRAILING_STOP_PCT:.0%}  "
-        f"risk/trade={RISK_PER_TRADE_PCT:.0%}  "
-        f"daily halt={DAILY_LOSS_LIMIT_PCT:.0%}  "
+        f"  Guardrails:   SL={sl_pct:.0%}  "
+        f"trail={trail_pct:.0%}  "
+        f"{sizing_desc}  "
+        f"daily halt={daily_pct:.0%}  "
         f"news=±{NEWS_BLACKOUT_MINUTES}m "
         f"({'on' if NEWS_CALENDAR.exists() else 'calendar missing'})"
     )
